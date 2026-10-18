@@ -1,0 +1,25 @@
+[project]
+name = "musicgraph"
+version = "0.1.0"
+description = "Local database of music tracks: spectrograms, audio features and embeddings"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+    "numpy>=1.26",
+    "librosa>=0.10.2",
+    "soundfile>=0.12",
+    "scikit-learn>=1.4",
+    "umap-learn>=0.5.6",
+    "pandas>=2.2",
+    "plotly>=5.20",
+    "matplotlib>=3.8",
+]
+
+[project.scripts]
+mg = "musicgraph.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
