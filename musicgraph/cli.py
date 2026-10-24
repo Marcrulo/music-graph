@@ -40,23 +40,39 @@ def spectro(force: bool = typer.Option(False, help="Recompute all")):
 
 
 @app.command("features")
-def features_cmd(force: bool = typer.Option(False, help="Recompute all")):
-    """Extract handcrafted features for tracks that have a spectrogram."""
+def features_cmd(
+    stage: str = typer.Option("dsp,stems,models,lyrics", help="Comma-separated stages, run in this order"),
+    force: bool = typer.Option(False, help="Recompute even if the outputs exist"),
+    limit: int = typer.Option(0, help="Max tracks per stage (0 = all)"),
+    track: str = typer.Option("", help="Comma-separated track ids (default: all)"),
+):
+    """Extract audio features and model embeddings (needs `uv run --group full`).
+
+    Each stage loads its models once and processes every track missing its outputs, so it's safe to interrupt and rerun.
+    """
+    from . import extract
+
     con = db.connect()
-    if force:
-        todo = con.execute("SELECT t.* FROM tracks t JOIN spectrograms s ON s.track_id = t.id ORDER BY t.id").fetchall()
-    else:
-        todo = [
-            t for t in db.tracks_missing(con, "features", "x.extractor = ? AND x.version = ?",
-                                         (features.EXTRACTOR, features.VERSION))
-            if spectrogram.spec_path(t["id"]).exists()
-        ]
-    for t in todo:
-        typer.echo(f"  #{t['id']} {t['artist']} - {t['title']}")
-        y = spectrogram.load_audio(t["audio_path"])
-        names, vec = features.extract(y, spectrogram.load(t["id"]))
-        db.upsert_features(con, t["id"], features.EXTRACTOR, features.VERSION, names, vec)
-    typer.echo(f"extracted features for {len(todo)} tracks")
+    ids = {int(t) for t in track.split(",") if t.strip()} or None
+    done = extract.run(con, [s.strip() for s in stage.split(",") if s.strip()], force=force,
+                       limit=limit or None, track_ids=ids, log=lambda m: typer.echo(m))
+    typer.echo(f"done: {done}")
+
+
+@app.command()
+def setup(warm: bool = typer.Option(False, help="Also load every stage once to download Hugging Face / demucs weights")):
+    """Download the model files the feature stages need (needs `uv run --group full`)."""
+    from .extract import STAGE_ORDER, stage_class
+    from .extract.models import download_models
+
+    typer.echo(f"Essentia models: downloaded {download_models(log=typer.echo)} files")
+    if warm:
+        import torch  # noqa: F401  before essentia/TensorFlow
+
+        for name in STAGE_ORDER:
+            typer.echo(f"warming {name} ...")
+            stage_class(name)().load()
+    typer.echo("setup done")
 
 
 @app.command("embed")
@@ -64,7 +80,7 @@ def embed_cmd():
     """Fit PCA + UMAP over all tracks and write the interactive map."""
     con = db.connect()
     info = embed.build(con)
-    typer.echo(f"{info['n']} tracks, {info['dims']} features -> {info['pca_dims']} PCA dims")
+    typer.echo(f"{info['n']} tracks, {info['source']}: {info['dims']} dims -> {info['pca_dims']} PCA dims")
     typer.echo(f"map: {info['map']}")
 
 
@@ -77,18 +93,22 @@ def run(
     if per_tag:
         fetch(tags=tags, per_tag=per_tag)
     spectro(force=False)
-    features_cmd(force=False)
+    features_cmd(stage="dsp,stems,models,lyrics", force=False, limit=0, track="")
     embed_cmd()
 
 
 @app.command()
 def stats():
-    """Counts per genre and per pipeline stage."""
+    """Counts per pipeline stage and extractor."""
     con = db.connect()
     q = lambda sql, *p: con.execute(sql, p).fetchone()[0]
     typer.echo(f"tracks:       {q('SELECT COUNT(*) FROM tracks')}")
     typer.echo(f"spectrograms: {q('SELECT COUNT(*) FROM spectrograms')}")
-    typer.echo(f"features:     {q('SELECT COUNT(*) FROM features WHERE extractor = ? AND version = ?', features.EXTRACTOR, features.VERSION)}")
+    from .extract import all_outputs
+
+    for extractor, version in [(features.EXTRACTOR, features.VERSION), *all_outputs()]:
+        n = q("SELECT COUNT(*) FROM features WHERE extractor = ? AND version = ?", extractor, version)
+        typer.echo(f"  {extractor + ' v' + str(version) + ':':<16}{n}")
     typer.echo(f"embedded:     {q('SELECT COUNT(*) FROM embeddings WHERE method = ?', 'pca')}")
     hours = (q("SELECT SUM(duration_s) FROM tracks") or 0) / 3600
     typer.echo(f"total audio:  {hours:.1f} h")

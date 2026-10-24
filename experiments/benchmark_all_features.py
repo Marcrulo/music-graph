@@ -4,9 +4,12 @@ Each catalogue row is one timed function returning a dict of track-level values
 (what we'd store). Shared intermediates (decoding, STFT, stems, backbone embeddings)
 and one-off model loading are timed separately, so per-feature times are marginal.
 
-Usage: uv run --group full python experiments/benchmark_all_features.py [track_id]
+Usage: uv run --group full python experiments/benchmark_all_features.py [track_id ...] [--workers N]
+  one track: run in-process and print the full report
+  several tracks / --workers: one subprocess per track, N at a time (logs in data/bench/)
 """
 
+import contextlib
 import gc
 import json
 import os
@@ -21,6 +24,9 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 warnings.filterwarnings("ignore")
 
 import torch  # import before essentia/TF, avoids a broken partial torch import later
+
+if os.environ.get("BENCH_THREADS"):
+    torch.set_num_threads(int(os.environ["BENCH_THREADS"]))
 import librosa
 import numpy as np
 import scipy.signal
@@ -46,6 +52,26 @@ def n_values(out) -> int:
     return int(np.size(out))
 
 
+def peak_rss_gb() -> float:
+    """Peak RSS of this process since the last reset (Linux: VmHWM, reset via clear_refs)."""
+    hwm = next(int(l.split()[1]) for l in open("/proc/self/status") if l.startswith("VmHWM"))
+    try:
+        open("/proc/self/clear_refs", "w").write("5")  # reset the high-water mark for the next feature
+    except OSError:
+        pass
+    return hwm / 2 ** 20
+
+
+def release_memory():
+    """Return freed heap pages to the OS (glibc keeps them otherwise; RSS crept up ~1 GB per stage)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def run(cat: str, name: str, fn, *args, shared=False, **kw):
     t0 = time.perf_counter()
     try:
@@ -57,10 +83,12 @@ def run(cat: str, name: str, fn, *args, shared=False, **kw):
             traceback.print_exc()
     dt = time.perf_counter() - t0
     dims = None if shared else n_values(out)
-    RESULTS.append({"cat": cat, "feature": name, "status": status, "seconds": round(dt, 3), "dims": dims, "note": note})
+    rss = peak_rss_gb()
+    RESULTS.append({"cat": cat, "feature": name, "status": status, "seconds": round(dt, 3), "dims": dims, "note": note,
+                    "peak_rss_gb": round(rss, 2)})
     if status == "ok" and not shared:
         VALUES[f"{cat}/{name}"] = out
-    print(f"  {status:<4} {dt:7.2f}s  [{cat}] {name}" + (f"  dims={dims}" if dims else "") + (f"  -- {note}" if note else ""), flush=True)
+    print(f"  {status:<4} {dt:7.2f}s {rss:5.1f}G  [{cat}] {name}" + (f"  dims={dims}" if dims else "") + (f"  -- {note}" if note else ""), flush=True)
     return out
 
 
@@ -131,8 +159,7 @@ def load_shared(track) -> A:
 
     def _ess_spectra():
         w, spec = es.Windowing(type="blackmanharris62"), es.Spectrum()
-        frames = list(es.FrameGenerator(a.mono44, frameSize=2048, hopSize=1024, startFromZero=True))
-        return frames, [spec(w(f)) for f in frames]
+        return None, [spec(w(f)) for f in es.FrameGenerator(a.mono44, frameSize=2048, hopSize=1024, startFromZero=True)]
     a.ess_frames, a.ess_spectra = run("shared", "essentia frames+spectra 44.1k", _ess_spectra, shared=True)
 
     def _ess_peaks():
@@ -812,13 +839,36 @@ def f_separation(a):
     return out
 
 
+MIN_VOCAL_S = 5.0  # less detected vocal than this counts as instrumental (stem bleed)
+
+
+def vocal_segments_16k(a, pad_s=0.5, min_s=1.0, gap_s=0.3):
+    """Vocal stem at 16 kHz cut to vocal-active regions (padded, merged), joined by short gaps."""
+    src = a.stems["vocals"].mean(0) if getattr(a, "stems", None) else a.mono44
+    v16 = librosa.resample(src, orig_sr=44100, target_sr=16000).astype(np.float32)
+    if getattr(a, "stems", None) is None:
+        return v16
+    if not hasattr(a, "vocal_active"):
+        r = librosa.feature.rms(y=a.stems["vocals"].mean(0), frame_length=4096, hop_length=2048)[0]
+        mix_r = librosa.feature.rms(y=a.mono44, frame_length=4096, hop_length=2048)[0]
+        a.vocal_active = db_(r ** 2) > db_(mix_r ** 2) - 15
+    fps = 44100 / 2048
+    k = int(pad_s * fps)
+    act = np.convolve(a.vocal_active, np.ones(2 * k + 1), "same") > 0
+    edges = np.flatnonzero(np.diff(np.r_[0, act.astype(int), 0]))
+    gap = np.zeros(int(gap_s * 16000), np.float32)
+    parts = [np.r_[v16[int(s / fps * 16000):int(e / fps * 16000)], gap]
+             for s, e in zip(edges[::2], edges[1::2]) if (e - s) / fps >= min_s]
+    return np.concatenate(parts) if parts else np.zeros(0, np.float32)
+
+
 def vocal_crepe(a):
     import torch
     import torchcrepe
 
     v = librosa.resample(a.stems["vocals"].mean(0), orig_sr=44100, target_sr=16000)
     with torch.no_grad():
-        p, per = torchcrepe.predict(torch.tensor(v)[None], 16000, hop_length=160, fmin=60, fmax=1000, model="full",
+        p, per = torchcrepe.predict(torch.tensor(v)[None], 16000, hop_length=160, fmin=60, fmax=1000, model="tiny",
                                     return_periodicity=True, batch_size=1024, device="cpu")
     a.vocal_pitch, a.vocal_periodicity = p[0].numpy(), per[0].numpy()
     r = librosa.feature.rms(y=v, frame_length=1024, hop_length=160)[0][: len(a.vocal_pitch)]
@@ -856,16 +906,33 @@ def f_semantic(a):
     out["Production / audio quality"] = heads("nsynth_bright_dark", "nsynth_reverb", "timbre")
 
     def language():
+        import gzip
+
+        import torch
         from transformers import pipeline
 
+        y16 = vocal_segments_16k(a)
+        a.transcript = ""
+        if len(y16) < MIN_VOCAL_S * 16000:  # instrumental: Whisper would only hallucinate
+            return {"language": "none", "language_prob": 0.0, "vocal_seconds": len(y16) / 16000, "n_words": 0}
         asr = model("whisper-tiny", lambda: pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device="cpu"))
-        src = a.stems["vocals"].mean(0) if getattr(a, "stems", None) else a.mono44
-        y16 = librosa.resample(src, orig_sr=44100, target_sr=16000)
-        r = asr({"raw": y16, "sampling_rate": 16000}, chunk_length_s=30, return_language=True,
-                generate_kwargs={"task": "transcribe"})
-        a.transcript = r["text"]
-        langs = [c.get("language") for c in r.get("chunks", []) if c.get("language")]
-        return {"language": max(set(langs), key=langs.count) if langs else "?", "n_words": len(r["text"].split())}
+        m, gc_ = asr.model, asr.model.generation_config
+        feats = asr.feature_extractor(y16[: 16000 * 30], sampling_rate=16000, return_tensors="pt").input_features
+        with torch.no_grad():
+            logits = m(input_features=feats, decoder_input_ids=torch.tensor([[gc_.decoder_start_token_id]])).logits[0, -1]
+        codes, ids = list(gc_.lang_to_id), torch.tensor(list(gc_.lang_to_id.values()))
+        p = logits[ids].softmax(0)
+        lang = codes[int(p.argmax())].strip("<|>")
+        pieces = [{"raw": y16[i:i + 16000 * 30], "sampling_rate": 16000} for i in range(0, len(y16), 16000 * 30)]
+        # 128 tokens is plenty for 30 s of singing; it caps repetition loops (71 s -> 20 s on a 5 min track)
+        texts = [r["text"].strip() for r in asr(pieces, batch_size=1, generate_kwargs={
+            "task": "transcribe", "language": lang, "max_new_tokens": 128})]
+        # Whisper's repetition-loop check, per 30 s piece: highly compressible text is a hallucination
+        ratios = [len(t) / max(len(gzip.compress(t.encode())), 1) for t in texts]
+        kept = [t for t, r in zip(texts, ratios) if t and r < 2.4]
+        a.transcript = " ".join(kept)
+        return {"language": lang, "language_prob": float(p.max()), "vocal_seconds": len(y16) / 16000,
+                "n_words": len(a.transcript.split()), "kept_pieces": len(kept) / len(pieces)}
     out["Language of vocals"] = language
     out["Context / use-case tags"] = lambda: {"moodtheme": ess_head("mtg_jamendo_moodtheme-discogs-effnet-1", emb())}
     out["Approachability / engagement"] = heads("approachability_regression", "engagement_regression")
@@ -922,18 +989,13 @@ def f_learned(a):
         for h in hooks:
             h.remove()
         res["mert_layers_mean"] = np.mean(layers, 0).mean(0)
-        try:
-            from muq import MuQ
-
-            mq = model("MuQ-large", lambda: MuQ.from_pretrained("OpenMuQ/MuQ-large-msd-iter").eval())
-            y24t = torch.tensor(y24, dtype=torch.float32)
-            embs = []
-            with torch.no_grad():
-                for c in chunks(y24t, 24000):
-                    embs.append(mq(c[None], output_hidden_states=False).last_hidden_state.mean(1)[0].numpy())
-            res["muq"] = np.mean(embs, 0)
-        except Exception as e:
-            res["muq_error"] = f"{type(e).__name__}: {e}"[:100]
+        mq = model("MuQ-large", load_muq)
+        y24t = torch.tensor(y24, dtype=torch.float32)
+        embs = []
+        with torch.no_grad():
+            for c in chunks(y24t, 24000):
+                embs.append(mq(c[None], output_hidden_states=False).last_hidden_state.mean(1)[0].numpy())
+        res["muq"] = np.mean(embs, 0)
         return res
     out["MERT, MuQ"] = mert_muq
 
@@ -945,14 +1007,15 @@ def f_learned(a):
         m = model("CLAP htsat-unfused", lambda: ClapModel.from_pretrained("laion/clap-htsat-unfused").eval())
         y48 = librosa.resample(a.mono44, orig_sr=44100, target_sr=48000)
         with torch.no_grad():
-            cs = chunks(y48, 48000)
-            try:
-                inp = proc(audio=cs, sampling_rate=48000, return_tensors="pt")
-            except TypeError:
-                inp = proc(audios=cs, sampling_rate=48000, return_tensors="pt")
-            e = m.get_audio_features(**inp)
-            e = getattr(e, "pooler_output", e)
-            e = torch.nn.functional.normalize(e, dim=-1).mean(0)
+            cs, es_ = chunks(y48, 48000), []
+            for i in range(0, len(cs), 4):  # small batches: the whole track at once peaked at several GB
+                try:
+                    inp = proc(audio=cs[i:i + 4], sampling_rate=48000, return_tensors="pt")
+                except TypeError:
+                    inp = proc(audios=cs[i:i + 4], sampling_rate=48000, return_tensors="pt")
+                e = m.get_audio_features(**inp)
+                es_.append(getattr(e, "pooler_output", e))
+            e = torch.nn.functional.normalize(torch.cat(es_), dim=-1).mean(0)
             prompts = ["strings", "piano", "brass", "woodwinds", "acoustic guitar", "electric guitar",
                        "drums", "synthesizer", "singing voice", "choir"]
             t = proc(text=[f"music with {p}" for p in prompts], return_tensors="pt", padding=True)
@@ -969,9 +1032,12 @@ def f_learned(a):
         proc = model("Encodec processor", lambda: AutoProcessor.from_pretrained("facebook/encodec_24khz"))
         m = model("Encodec 24khz", lambda: EncodecModel.from_pretrained("facebook/encodec_24khz").eval())
         y24 = librosa.resample(a.mono44, orig_sr=44100, target_sr=24000)
-        inp = proc(raw_audio=y24, sampling_rate=24000, return_tensors="pt")
+        zs = []
         with torch.no_grad():
-            z = m.encoder(inp["input_values"])[0]  # (128, T)
+            for c in chunks(y24, 24000):  # whole-track encoding peaked at several GB
+                inp = proc(raw_audio=c, sampling_rate=24000, return_tensors="pt")
+                zs.append(m.encoder(inp["input_values"])[0])  # (128, T)
+        z = torch.cat(zs, 1)
         return {"latent_mean": z.mean(1).numpy(), "latent_std": z.std(1).numpy()}
     out["Encodec / Jukebox latents"] = encodec
 
@@ -1004,6 +1070,33 @@ def f_learned(a):
     return out
 
 
+def load_muq():
+    """MuQ-large with a transformers-v5 shim for its Wav2Vec2Conformer encoder.
+
+    MuQ builds the encoder from an EasyDict config (v5 needs `_attn_implementation`) and
+    reads `out["hidden_states"]`, which v5 no longer returns from the bare encoder. We
+    record them with hooks, matching v4: the input to each layer, then the final output.
+    """
+    from muq import MuQ
+
+    mq = MuQ.from_pretrained("OpenMuQ/MuQ-large-msd-iter").eval()
+    enc = mq.model.conformer
+    enc.config._attn_implementation = "eager"
+    hidden = []
+    for layer in enc.layers:
+        layer.register_forward_pre_hook(lambda mod, args: hidden.append(args[0]))
+    forward = enc.forward
+
+    def forward_with_hidden(*args, output_hidden_states=False, **kw):
+        hidden.clear()
+        out = forward(*args, **kw)
+        states = (*hidden, out.last_hidden_state)
+        hidden.clear()
+        return {"last_hidden_state": out.last_hidden_state, "hidden_states": states}
+    enc.forward = forward_with_hidden
+    return mq
+
+
 def openl3(a):
     """Essentia OpenL3 (music, mel128, 512-d), following the Essentia model docs."""
     import essentia.standard as es
@@ -1026,10 +1119,13 @@ def openl3(a):
     batch = np.transpose(np.array(patches)[:, None], [0, 3, 2, 1])  # (n, 128, 199, 1)
     m = model("essentia openl3", lambda: es.TensorflowPredict(graphFilename=str(ESS_MODELS / "openl3-music-mel128-emb512-3.pb"),
                                                                inputs=["melspectrogram"], outputs=["embeddings"], squeeze=False))
-    pool = Pool()
-    pool.set("melspectrogram", batch)
-    e = np.asarray(m(pool)["embeddings"]).squeeze()
-    return {"openl3": e.reshape(-1, e.shape[-1]).mean(0)}
+    embs = []
+    for i in range(0, len(batch), 32):  # the whole track in one TF batch peaked at ~7.5 GB
+        pool = Pool()
+        pool.set("melspectrogram", batch[i:i + 32])
+        e = np.asarray(m(pool)["embeddings"])
+        embs.append(e.reshape(-1, e.shape[-1]))
+    return {"openl3": np.concatenate(embs).mean(0)}
 
 
 # ---------------------------------------------------------------- 10. summary statistics
@@ -1062,30 +1158,44 @@ def f_summary(a):
 
 # ---------------------------------------------------------------- 11. psychoacoustic (mosqito, 48 kHz)
 
+PSYCHO_EXCERPTS = (0.2, 0.5, 0.8)  # excerpt centres (fraction of the track); mosqito is ~4x realtime
+PSYCHO_EXCERPT_S = 10.0
+
+
 def f_psycho(a):
     out = {}
-    sig = lambda: librosa.resample(a.mono44, orig_sr=44100, target_sr=48000)
+
+    def excerpts():
+        if not hasattr(a, "psy_excerpts"):
+            y48 = librosa.resample(a.mono44, orig_sr=44100, target_sr=48000)
+            n = int(48000 * PSYCHO_EXCERPT_S)
+            a.psy_excerpts = [y48[max(0, int(c * len(y48)) - n // 2):][:n] for c in PSYCHO_EXCERPTS]
+        return a.psy_excerpts
 
     def zw():
-        from mosqito.sq_metrics import loudness_zwtv
+        from mosqito.sq_metrics import loudness_zwtv, sharpness_din_from_loudness
 
-        N, N_spec, bark, t = loudness_zwtv(sig(), 48000, field_type="free")
-        a.N_spec = N_spec
-        return {**stats(N, "sones_"), "specific_mean": np.asarray(N_spec).mean(1)}
+        Ns, specs, sharp = [], [], []
+        for x in excerpts():
+            N, N_spec, bark, t = loudness_zwtv(x, 48000, field_type="free")
+            keep = t >= 0.5  # drop the temporal-integration start-up transient
+            Ns.append(N[keep])
+            specs.append(np.asarray(N_spec)[:, keep])
+            sharp.append(np.asarray(sharpness_din_from_loudness(N, N_spec, weighting="din"))[keep])
+        a.psy_sharpness = np.concatenate(sharp)
+        return {**stats(np.concatenate(Ns), "sones_"), "specific_mean": np.hstack(specs).mean(1)}
     out["Zwicker loudness (sones), specific loudness"] = zw
 
     def sharp():
-        from mosqito.sq_metrics import sharpness_din_tv
-
-        S, t = sharpness_din_tv(sig(), 48000, weighting="din", field_type="free", skip=0.5)
-        return stats(S)
+        if not hasattr(a, "psy_sharpness"):
+            zw()
+        return stats(a.psy_sharpness)
     out["Sharpness"] = sharp
 
     def rough():
         from mosqito.sq_metrics import roughness_dw
 
-        R, R_spec, bark, t = roughness_dw(sig(), 48000, overlap=0.5)
-        return stats(R)
+        return stats(np.concatenate([roughness_dw(x, 48000, overlap=0.5)[0] for x in excerpts()]))
     out["Roughness"] = rough
 
     def fluct():
@@ -1100,7 +1210,7 @@ def f_psycho(a):
     def tonality():
         from mosqito.sq_metrics import pr_ecma_st
 
-        x = sig()[: 48000 * 10]  # stationary metric: a 10 s excerpt
+        x = excerpts()[len(PSYCHO_EXCERPTS) // 2]  # stationary metric: the middle excerpt
         t_pr, pr, prom, freqs = pr_ecma_st(x, 48000, prominence=True)
         return {"total_prominence_ratio": float(t_pr), "n_prominent_tones": int(np.sum(prom))}
     out["Tonality (psychoacoustic)"] = tonality
@@ -1373,7 +1483,7 @@ def f_meta(a, track):
 
         text = track["lyrics"] or getattr(a, "transcript", "")
         if not text:
-            raise RuntimeError("no lyrics and no transcript")
+            return {"source": "none (instrumental or no lyrics)"}
         m = model("MiniLM-L6 (lyrics)", lambda: SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu"))
         return {"source": "lyrics" if track["lyrics"] else "whisper transcript", "embedding": m.encode(text)}
     out["Lyrics embeddings, lyric themes"] = lyrics
@@ -1391,8 +1501,7 @@ NOT_AVAILABLE = {
 }
 
 
-def main():
-    track_id = int(sys.argv[1]) if len(sys.argv) > 1 else 189
+def bench_track(track_id: int):
     con = db.connect()
     track = db.get_track(con, track_id)
     print(f"Track #{track_id}: {track['artist']} - {track['title']} ({track['duration_s']:.0f}s)\n", flush=True)
@@ -1401,21 +1510,27 @@ def main():
 
     groups = [
         ("1. spectral", lambda: f_spectral(a)), ("2. timbre", lambda: f_timbre(a)), ("3. energy", lambda: f_energy(a)),
-        ("7. separation", lambda: f_separation(a)),  # stems early: harmony/vocal reuse them
-        ("4. harmony", lambda: f_harmony(a)), ("5. rhythm", lambda: f_rhythm(a)), ("6. structure", lambda: f_structure(a)),
-        ("8. semantic", lambda: f_semantic(a)), ("9. learned", lambda: f_learned(a)), ("10. summary", lambda: f_summary(a)),
+        # stem users run back to back (vocal after semantic: it reuses the transcript), then stems are freed
+        ("7. separation", lambda: f_separation(a)), ("4. harmony", lambda: f_harmony(a)),
+        ("8. semantic", lambda: f_semantic(a)), ("15. vocal", lambda: f_vocal(a)),
+        ("5. rhythm", lambda: f_rhythm(a)), ("6. structure", lambda: f_structure(a)),
+        ("9. learned", lambda: f_learned(a)), ("10. summary", lambda: f_summary(a)),
         ("11. psychoacoustic", lambda: f_psycho(a)), ("12. texture", lambda: f_texture(a)), ("13. stereo", lambda: f_stereo(a)),
-        ("14. production", lambda: f_production(a)), ("15. vocal", lambda: f_vocal(a)), ("16. non-audio", lambda: f_meta(a, track)),
+        ("14. production", lambda: f_production(a)), ("16. non-audio", lambda: f_meta(a, track)),
     ]
     only = [c.strip() for c in os.environ.get("BENCH_ONLY", "").split(",") if c.strip()]
     for cat, make in groups:
         if only and cat.split(".")[0] not in only:
             continue
         print(f"\n== {cat}", flush=True)
-        for name, fn in make().items():
-            run(cat, name, fn)
-        _MODELS.clear()  # free models between categories; keeping all resident caused swapping
-        gc.collect()
+        with heavy_lock() if cat.split(".")[0] in HEAVY_CATEGORIES else contextlib.nullcontext():
+            for name, fn in make().items():
+                run(cat, name, fn)
+            _MODELS.clear()  # free models between categories; keeping all resident caused swapping
+            if cat.startswith("15."):
+                a.stems = None  # last stem user
+            gc.collect()
+            release_memory()
         for (c, n), note in NOT_AVAILABLE.items():
             if c == cat:
                 na(c, n, note)
@@ -1445,6 +1560,103 @@ def main():
     json.dump({"track_id": track_id, "duration_s": a.dur, "wall_s": total, "results": RESULTS,
                "values": VALUES}, open(path, "w"), indent=1, default=lambda o: np.asarray(o).tolist())
     print(f"\nresults: {path}")
+
+
+HEAVY_CATEGORIES = {"7", "9"}  # demucs / big learned models: one worker at a time
+MIN_START_GB = 4.0  # free RAM needed to start another worker
+MIN_FREE_GB = 1.0   # below this, kill the newest worker and requeue its track
+
+
+def mem_available_gb() -> float:
+    return next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable")) / 2 ** 20
+
+
+class heavy_lock:
+    """Cross-process lock (only active under bench_parallel) so memory-hungry stages don't overlap."""
+
+    def __enter__(self):
+        path = os.environ.get("BENCH_HEAVY_LOCK")
+        self.f = None
+        if path:
+            import fcntl
+
+            self.f = open(path, "w")
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc):
+        if self.f:
+            self.f.close()  # releases the flock
+
+
+def bench_parallel(track_ids: list[int], workers: int):
+    """One subprocess per track, up to `workers` at a time, threads split between them.
+
+    Memory guards: stages in HEAVY_CATEGORIES run under a cross-process lock, a new worker
+    only starts with MIN_START_GB free, and if free RAM drops below MIN_FREE_GB the newest
+    worker is killed, its track requeued and the worker limit lowered.
+    """
+    import resource
+    import signal
+    import subprocess
+
+    threads = str(max(1, (os.cpu_count() or 1) // workers))
+    log_dir = config.DATA_DIR / "bench"
+    log_dir.mkdir(exist_ok=True)
+    env = {**os.environ, "BENCH_THREADS": threads, "OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads,
+           "OPENBLAS_NUM_THREADS": threads, "BENCH_HEAVY_LOCK": str(log_dir / ".heavy.lock")}
+    print(f"{len(track_ids)} tracks, {workers} workers x {threads} threads; logs in {log_dir}/track_<id>.log", flush=True)
+    t0, queue, running, failed = time.perf_counter(), list(track_ids), {}, []
+    min_avail = mem_available_gb()
+    last_start = 0.0
+    while queue or running:
+        # stagger starts so the RAM check sees the previous worker's footprint
+        if (queue and len(running) < workers and time.perf_counter() - last_start > 20
+                and (not running or mem_available_gb() > MIN_START_GB)):
+            tid = queue.pop(0)
+            log = open(log_dir / f"track_{tid}.log", "w")
+            running[tid] = (subprocess.Popen([sys.executable, __file__, str(tid)], env=env, stdout=log, stderr=subprocess.STDOUT), log)
+            last_start = time.perf_counter()
+        time.sleep(1)
+        avail = mem_available_gb()
+        min_avail = min(min_avail, avail)
+        if avail < MIN_FREE_GB and len(running) > 1:
+            tid = list(running)[-1]
+            proc, log = running.pop(tid)
+            proc.send_signal(signal.SIGKILL)
+            proc.wait()
+            log.close()
+            queue.insert(0, tid)
+            workers = max(1, len(running))
+            print(f"  RAM low ({avail:.1f} GB): killed track {tid}, requeued, workers -> {workers}", flush=True)
+            continue
+        for tid, (proc, log) in list(running.items()):
+            if proc.poll() is not None:
+                log.close()
+                del running[tid]
+                if proc.returncode:
+                    failed.append(tid)
+                print(f"  track {tid} done (exit {proc.returncode}) at {time.perf_counter() - t0:.0f}s", flush=True)
+    wall = time.perf_counter() - t0
+    con = db.connect()
+    audio_s = sum(db.get_track(con, t)["duration_s"] for t in track_ids)
+    peak_gb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 2 ** 20
+    print(f"\nwall {wall:.0f}s for {audio_s:.0f}s of audio -> {wall / audio_s:.2f}x realtime throughput "
+          f"({wall / len(track_ids):.0f}s per track); peak worker RSS {peak_gb:.1f} GB, min RAM available {min_avail:.1f} GB"
+          + (f"; failed: {failed}" if failed else ""))
+
+
+def main():
+    args = sys.argv[1:]
+    workers = 1
+    if "--workers" in args:
+        i = args.index("--workers")
+        workers = int(args[i + 1])
+        del args[i:i + 2]
+    track_ids = [int(t) for t in args] or [189]
+    if len(track_ids) == 1 and workers == 1:
+        bench_track(track_ids[0])
+    else:
+        bench_parallel(track_ids, workers)
 
 
 if __name__ == "__main__":

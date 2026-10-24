@@ -239,11 +239,21 @@ Source labels (genre/instrument/mood tags) are never stored or used.
 
 ## Implementation Status
 
-What `musicgraph` currently extracts and stores (DB table `features`/`embeddings`).
+What `musicgraph` currently extracts and stores (DB table `features`/`embeddings`). Stages live in `musicgraph/extract/` and run with `uv run --group full mg features`; each stage loads its models once and processes every track missing its outputs. Measured on a 5:14 track: dsp 79 s, stems ~95 s, models 61 s, lyrics <1 s (≈ 0.75× realtime, vs 2.8× for the benchmark).
 
 | Extractor / method | Version | Dims | Contents |
 |---|---|---|---|
-| `handcrafted` | 1 | 294 | MFCC 0–19 + deltas, chroma (12), tonnetz (6), spectral centroid / bandwidth / rolloff / flatness / contrast (7), ZCR, RMS, onset strength, each as mean/std/p10/p90; plus tempo, beat strength mean/std, beat regularity, onset rate, duration |
-| `pca` (embedding) | – | ~65 | StandardScaler → PCA (95% variance) of `handcrafted` v1 |
+| `handcrafted` | 1 | 294 | *(legacy, `musicgraph/features.py`; superseded by the extractors below.)* MFCC 0–19 + deltas, chroma (12), tonnetz (6), spectral centroid / bandwidth / rolloff / flatness / contrast (7), ZCR, RMS, onset strength, each as mean/std/p10/p90; plus tempo, beat strength mean/std, beat regularity, onset rate, duration |
+| `dsp` | 1 | 4462 | Stage `dsp`, full track. Sections 1–6, 10, 12–14 as in the benchmark, names `<category>/<feature>.<stat>[i]`; plus §11 fluctuation-strength and warmth proxies. Scattering on the 3×30 s excerpts; true peak via 4× polyphase oversampling. Left out: mosqito psychoacoustics, madmom downbeats/meter (bar density uses every 4th librosa beat), k-means codebook, trajectories, segment label sequence |
+| `stems` | 1 | 109 | Stage `stems`: demucs `htdemucs` (overlap 0.1) on 3×30 s excerpts at 20/50/80% of the track (whole track if ≤ 90 s). Stem RMS + energy share, vocal activity (overall + thirds), speechiness, per-stem centroid/13 MFCC/onset rate, bass pitch-class + root-motion histograms (pyin on bass stem), §15 vocal features (torchcrepe `tiny`), vocal onset rate, words/s |
+| `effnet` | 1 | 1280 | Discogs-EffNet embedding, mean over the excerpts |
+| `maest` | 1 | 768 | MAEST-30s embedding, mean over the excerpts |
+| `musicnn` | 1 | 200 | MSD-MusiCNN embedding, mean over the excerpts |
+| `semantic` | 1 | 627 | Essentia classifier heads on EffNet (genre_discogs400, mtg_jamendo genre/moodtheme/instrument, moods, danceability, nsynth, timbre, gender, voice/instrumental, approachability, engagement) and MusiCNN (DEAM, emoMusic arousal/valence), plus 10 CLAP zero-shot instrument similarities. Model outputs from audio, not source labels |
+| `clap` | 1 | 512 | LAION CLAP htsat-unfused audio embedding, 10 s chunks of the excerpts |
+| `mert` | 1 | 768 | MERT-v1-95M, mean over layers and time, 10 s chunks of the excerpts |
+| `muq` | 1 | 1024 | MuQ-large-msd-iter last hidden state, mean over time, 10 s chunks of the excerpts (transformers-v5 shim) |
+| `lyrics` | 1 | 386 | all-MiniLM-L6-v2 embedding of stored lyrics, else the Whisper transcript (`transcripts` table, vocal-active parts of the excerpts); + has_text, from_transcript flags |
+| `pca` (embedding) | – | varies | Each extractor (and each `dsp`/`stems` category) is a block: standardized, PCA to ≤ 32 dims (95% var), scaled to unit variance so blocks weigh equally; concatenated → PCA (95%). Falls back to `handcrafted` v1 until ≥ 5 tracks have every extractor |
 | `umap2d` (embedding) | – | 2 | UMAP (cosine) of `pca`, for the map; coloured by KMeans (12) clusters on `pca` |
-| `experiments/benchmark_all_features.py` | – | ~14k | Prototype of every ✅ row above, run on one track (timings in `data/bench/`); not yet stored in the DB |
+| `experiments/benchmark_all_features.py` | – | ~14k | Prototype of every ✅ row above, run on one track (timings in `data/bench/`); not yet stored in the DB. Speed-ups: torchcrepe `tiny`; mosqito on 3×10 s excerpts (sharpness from Zwicker loudness); Whisper on vocal segments only; MuQ via a transformers-v5 shim. `experiments/feature_variance.py` measures each feature's cost vs. unique variance across tracks |

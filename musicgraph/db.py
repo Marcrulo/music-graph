@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS features (
     created_at TEXT,
     PRIMARY KEY (track_id, extractor, version)
 );
+CREATE TABLE IF NOT EXISTS transcripts (
+    track_id   INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    text       TEXT NOT NULL,  -- ASR of the vocal stem (audio-derived); '' for instrumentals
+    model      TEXT,
+    created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS embeddings (
     track_id INTEGER REFERENCES tracks(id) ON DELETE CASCADE,
     method   TEXT NOT NULL,
@@ -138,6 +144,17 @@ def upsert_features(con, track_id, extractor, version, names, vector) -> None:
         (track_id, extractor, version, json.dumps(names), to_blob(vector), now()),
     )
     con.commit()
+
+
+def upsert_transcript(con, track_id, text, model) -> None:
+    con.execute("INSERT OR REPLACE INTO transcripts (track_id, text, model, created_at) VALUES (?, ?, ?, ?)",
+                (track_id, text, model, now()))
+    con.commit()
+
+
+def get_transcript(con, track_id):
+    row = con.execute("SELECT text FROM transcripts WHERE track_id = ?", (track_id,)).fetchone()
+    return row["text"] if row else None
 
 
 def load_features(con, extractor, version):
